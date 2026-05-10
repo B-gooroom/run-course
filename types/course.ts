@@ -4,10 +4,11 @@ export type Coordinate = {
 };
 
 export type CourseType = "out-and-back" | "loop";
+export type RunMode = "city" | "park";
 
 export type CourseSummary = {
   estimatedDistanceKm: number;
-  estimatedDurationMin: number;
+  elevationGainM: number | null;
   turnCount: number;
 };
 
@@ -25,4 +26,5 @@ export type CourseRequest = {
   distanceKm: number;
   paceMinPerKm?: number;
   waypoints?: Coordinate[];
+  runMode?: RunMode;
 };

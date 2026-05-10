@@ -6,6 +6,7 @@ type Body = {
   distanceKm?: number;
   paceMinPerKm?: number;
   waypoints?: Array<{ lat?: number; lng?: number }>;
+  runMode?: "city" | "park";
 };
 
 function isValidCoord(value: unknown) {
@@ -37,7 +38,8 @@ export async function POST(request: Request) {
       location: { lat: safeLat, lng: safeLng },
       distanceKm,
       paceMinPerKm: body.paceMinPerKm,
-      waypoints
+      waypoints,
+      runMode: body.runMode
     });
 
     return NextResponse.json({ courses });

@@ -3,19 +3,20 @@ import {
   moveCoordinate,
   pathDistanceMeters
 } from "@/lib/geo/distance";
+import { getElevationGainMeters } from "@/lib/integrations/elevationProvider";
+import { getNearbyRunningAnchor } from "@/lib/integrations/nearbyPreference";
 import { getProviderRoute } from "@/lib/integrations/mapProvider";
-import type { Coordinate, Course, CourseRequest } from "@/types/course";
+import type { Coordinate, Course, CourseRequest, RunMode } from "@/types/course";
 
 const MIN_DISTANCE_KM = 1;
 const MAX_DISTANCE_KM = 30;
-const DEFAULT_PACE_MIN_PER_KM = 6.5;
 
 type Candidate = {
   id: string;
   name: string;
   type: Course["type"];
   controlPoints: Coordinate[];
-  pinned?: boolean;
+  scenicLabel?: "공원" | "수변";
 };
 
 function sanitizeDistance(distanceKm: number) {
@@ -47,6 +48,16 @@ function buildLoop(origin: Coordinate, distanceKm: number, startBearingDeg: numb
     type: "loop",
     controlPoints: [origin, p1, p2, p3, origin]
   };
+}
+
+function bearingBetweenDeg(from: Coordinate, to: Coordinate) {
+  const lat1 = (from.lat * Math.PI) / 180;
+  const lat2 = (to.lat * Math.PI) / 180;
+  const dLng = ((to.lng - from.lng) * Math.PI) / 180;
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+  const deg = (Math.atan2(y, x) * 180) / Math.PI;
+  return (deg + 360) % 360;
 }
 
 function turnCount(path: Coordinate[]) {
@@ -83,12 +94,23 @@ function turnCount(path: Coordinate[]) {
   return turns;
 }
 
-function calcScore(path: Coordinate[], targetMeters: number) {
+function calcScore(
+  path: Coordinate[],
+  targetMeters: number,
+  options?: {
+    routeSource?: "provider" | "fallback";
+    scenicLabel?: "공원" | "수변";
+    runMode?: RunMode;
+  }
+) {
   const actualMeters = pathDistanceMeters(path);
   const distanceErrorRatio = Math.abs(actualMeters - targetMeters) / targetMeters;
   const turnPenalty = turnCount(path) * 0.01;
-  const loopPenalty = 0;
-  return distanceErrorRatio + turnPenalty + loopPenalty;
+  const fallbackPenalty =
+    options?.routeSource === "fallback" ? (options?.runMode === "park" ? 0.45 : 0.25) : 0;
+  const scenicBonus =
+    options?.scenicLabel && options?.runMode === "park" ? 0.08 : options?.scenicLabel ? 0.03 : 0;
+  return distanceErrorRatio + turnPenalty + fallbackPenalty - scenicBonus;
 }
 
 function selectDiverseCourses(courses: Course[], count: number) {
@@ -118,33 +140,74 @@ function selectDiverseCourses(courses: Course[], count: number) {
   return selected.slice(0, count);
 }
 
+function pickTopCourses(courses: Course[], count: number, excludeIds?: Set<string>) {
+  const selected: Course[] = [];
+  const seen = new Set<string>(excludeIds ?? []);
+  for (const course of [...courses].sort((a, b) => a.score - b.score)) {
+    if (selected.length >= count) break;
+    if (seen.has(course.id)) continue;
+    selected.push(course);
+    seen.add(course.id);
+  }
+  return selected;
+}
+
 export async function generateCourses(input: CourseRequest): Promise<Course[]> {
   const distanceKm = sanitizeDistance(input.distanceKm);
-  const paceMinPerKm = input.paceMinPerKm ?? DEFAULT_PACE_MIN_PER_KM;
+  const runMode = input.runMode ?? "city";
+  void input.paceMinPerKm;
   const targetMeters = distanceKm * 1000;
   const origin = input.location;
   const waypoints = input.waypoints?.slice(0, 6) ?? [];
   const basePoint = waypoints[0] ?? origin;
   const distanceVariants = waypoints.length > 0 ? [0.78, 0.9, 1].map((r) => distanceKm * r) : [distanceKm];
+  const scenicAnchor = runMode === "park" ? await getNearbyRunningAnchor(basePoint) : null;
 
-  const autoCandidates: Candidate[] = distanceVariants.flatMap((candidateDistanceKm, index) => [
-    {
-      ...buildOutAndBack(basePoint, candidateDistanceKm, 20),
-      id: `out-20-v${index}`
-    },
-    {
-      ...buildOutAndBack(basePoint, candidateDistanceKm, 120),
-      id: `out-120-v${index}`
-    },
-    {
-      ...buildLoop(basePoint, candidateDistanceKm, 40),
-      id: `loop-40-v${index}`
-    },
-    {
-      ...buildLoop(basePoint, candidateDistanceKm, 200),
-      id: `loop-200-v${index}`
+  const autoCandidates: Candidate[] = distanceVariants.flatMap((candidateDistanceKm, index) => {
+    const base: Candidate[] = [
+      {
+        ...buildOutAndBack(basePoint, candidateDistanceKm, 20),
+        id: `out-20-v${index}`
+      },
+      {
+        ...buildOutAndBack(basePoint, candidateDistanceKm, 120),
+        id: `out-120-v${index}`
+      },
+      {
+        ...buildLoop(basePoint, candidateDistanceKm, 40),
+        id: `loop-40-v${index}`
+      },
+      {
+        ...buildLoop(basePoint, candidateDistanceKm, 200),
+        id: `loop-200-v${index}`
+      }
+    ];
+
+    if (!scenicAnchor) {
+      return base;
     }
-  ]);
+
+    const scenicDistanceKm = Math.max(1, candidateDistanceKm * 0.9);
+    const scenicBearing = bearingBetweenDeg(basePoint, scenicAnchor.point);
+    const scenicOutAndBack = buildOutAndBack(basePoint, scenicDistanceKm, scenicBearing);
+    const scenicLoop = buildLoop(basePoint, scenicDistanceKm, scenicBearing + 30);
+
+    return [
+      ...base,
+      {
+        ...scenicOutAndBack,
+        id: `scenic-out-v${index}`,
+        name: `${scenicAnchor.label} 중심 왕복`,
+        scenicLabel: scenicAnchor.label
+      },
+      {
+        ...scenicLoop,
+        id: `scenic-loop-v${index}`,
+        name: `${scenicAnchor.label} 중심 루프`,
+        scenicLabel: scenicAnchor.label
+      }
+    ];
+  });
   const pinnedCandidates: Candidate[] = [];
 
   if (waypoints.length >= 2) {
@@ -153,8 +216,7 @@ export async function generateCourses(input: CourseRequest): Promise<Course[]> {
       id: "pinned-forward",
       name: "핀 지정 코스",
       type: "loop",
-      controlPoints: [startPin, ...restPins, startPin],
-      pinned: true
+      controlPoints: [startPin, ...restPins, startPin]
     });
 
     if (waypoints.length > 2) {
@@ -162,8 +224,7 @@ export async function generateCourses(input: CourseRequest): Promise<Course[]> {
         id: "pinned-reverse",
         name: "핀 역순 코스",
         type: "loop",
-        controlPoints: [startPin, ...restPins.slice().reverse(), startPin],
-        pinned: true
+        controlPoints: [startPin, ...restPins.slice().reverse(), startPin]
       });
     }
   }
@@ -177,8 +238,11 @@ export async function generateCourses(input: CourseRequest): Promise<Course[]> {
       const via = rest.slice(0, -1);
       const providerRoute = await getProviderRoute({ start, via, end });
       const actualMeters = pathDistanceMeters(providerRoute.path);
-      const score = calcScore(providerRoute.path, targetMeters);
-      const estimatedDurationMin = Math.round((actualMeters / 1000) * paceMinPerKm);
+      const score = calcScore(providerRoute.path, targetMeters, {
+        routeSource: providerRoute.source,
+        scenicLabel: candidate.scenicLabel,
+        runMode
+      });
 
       return {
         id: candidate.id,
@@ -187,7 +251,7 @@ export async function generateCourses(input: CourseRequest): Promise<Course[]> {
         path: providerRoute.path,
         summary: {
           estimatedDistanceKm: Number((actualMeters / 1000).toFixed(2)),
-          estimatedDurationMin,
+          elevationGainM: null,
           turnCount: turnCount(providerRoute.path)
         },
         score
@@ -195,14 +259,60 @@ export async function generateCourses(input: CourseRequest): Promise<Course[]> {
     })
   );
 
-  const pinnedResolved = resolved.filter((course) => course.id.startsWith("pinned-"));
-  const autoResolved = resolved.filter((course) => !course.id.startsWith("pinned-"));
+  const toleranceSteps = [0.1, 0.15, 0.2];
+  let candidatePool: Course[] = [];
+  for (const tolerance of toleranceSteps) {
+    candidatePool = resolved.filter((course) => {
+      const courseMeters = course.summary.estimatedDistanceKm * 1000;
+      const errorRatio = Math.abs(courseMeters - targetMeters) / targetMeters;
+      return errorRatio <= tolerance;
+    });
+    if (candidatePool.length >= 3) break;
+  }
+
+  if (candidatePool.length === 0) return [];
+
+  const pinnedResolved = candidatePool.filter((course) => course.id.startsWith("pinned-"));
+  const autoResolved = candidatePool.filter((course) => !course.id.startsWith("pinned-"));
+  const scenicResolved = autoResolved.filter((course) => course.id.startsWith("scenic-"));
 
   if (pinnedResolved.length > 0) {
     const bestPinned = [...pinnedResolved].sort((a, b) => a.score - b.score)[0];
-    const bestAuto = selectDiverseCourses(autoResolved, 2);
-    return [bestPinned, ...bestAuto];
+    let bestAuto = selectDiverseCourses(autoResolved, 2);
+    if (runMode === "park" && scenicResolved.length > 0) {
+      const first = pickTopCourses(scenicResolved, 1);
+      const firstIds = new Set(first.map((course) => course.id));
+      const second = pickTopCourses(autoResolved, 1, firstIds);
+      bestAuto = [...first, ...second];
+    }
+    const selected = [bestPinned, ...bestAuto];
+    const withElevation = await Promise.all(
+      selected.map(async (course) => ({
+        ...course,
+        summary: {
+          ...course.summary,
+          elevationGainM: await getElevationGainMeters(course.path)
+        }
+      }))
+    );
+    return withElevation;
   }
 
-  return selectDiverseCourses(autoResolved, 3);
+  let selected = selectDiverseCourses(autoResolved, 3);
+  if (runMode === "park" && scenicResolved.length > 0) {
+    const scenicFirst = pickTopCourses(scenicResolved, 2);
+    const scenicIds = new Set(scenicFirst.map((course) => course.id));
+    const fill = pickTopCourses(autoResolved, 1, scenicIds);
+    selected = [...scenicFirst, ...fill].slice(0, 3);
+  }
+  const withElevation = await Promise.all(
+    selected.map(async (course) => ({
+      ...course,
+      summary: {
+        ...course.summary,
+        elevationGainM: await getElevationGainMeters(course.path)
+      }
+    }))
+  );
+  return withElevation;
 }
